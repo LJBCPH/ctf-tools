@@ -4,6 +4,80 @@
 
 CTF (Capture the Flag) challenge solver project. Use autonomous Ralph Wiggum loops to iterate on solutions.
 
+## Ralph Wiggum Setup
+
+> Already done on this machine. Follow these steps on a new machine.
+
+### 1. Install jq (required dependency)
+
+```bash
+# Windows (winget)
+winget install jqlang.jq
+
+# macOS
+brew install jq
+
+# Linux
+sudo apt install jq  # or: sudo dnf install jq
+```
+
+Restart your terminal after installing so `jq` is in PATH.
+
+### 2. Install the plugin
+
+Run these two commands inside a Claude Code session:
+
+```
+/plugin marketplace add anthropics/claude-code
+/plugin install ralph-wiggum@claude-plugins-official
+```
+
+Alternatively, clone the repo and copy the plugin directory manually:
+
+```bash
+git clone https://github.com/anthropics/claude-code.git /tmp/cc
+cp -r /tmp/cc/plugins/ralph-wiggum ~/.claude/plugins/
+chmod +x ~/.claude/plugins/ralph-wiggum/hooks/stop-hook.sh
+chmod +x ~/.claude/plugins/ralph-wiggum/scripts/setup-ralph-loop.sh
+```
+
+### 3. Register the stop hook
+
+Add this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/plugins/ralph-wiggum/hooks/stop-hook.sh\""
+          }
+        ]
+      }
+    ]
+  },
+  "plugins": [
+    {
+      "name": "ralph-wiggum",
+      "path": "$HOME/.claude/plugins/ralph-wiggum"
+    }
+  ]
+}
+```
+
+### 4. Restart Claude Code
+
+The plugin and hook only load on startup. Restart after any settings change.
+
+### 5. Verify
+
+Run `/ralph-loop --help` inside Claude Code — if it shows usage info, you're good.
+
+---
+
 ## Ralph Wiggum Loop Usage
 
 This project is set up for autonomous iterative development using the Ralph Wiggum plugin.
