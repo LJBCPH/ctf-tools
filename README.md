@@ -1,4 +1,4 @@
-# ctf-winner
+# ctf-tools
 
 A CLI toolkit for CTF challenges. Wraps common tools (nmap, dirb, ffuf) and adds custom modules for web recon and password attacks.
 
