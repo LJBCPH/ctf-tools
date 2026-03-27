@@ -5,18 +5,12 @@ A CLI toolkit for CTF challenges. Wraps common tools (nmap, dirb, ffuf) and adds
 ## Installation (WSL)
 
 ```bash
-cd /mnt/c/repo/ctf-winner
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-The `ctf` command is now available inside the venv. Add the activate line to your `~/.bashrc` or `~/.zshrc` to auto-activate it:
-
-```bash
-echo "source /mnt/c/repo/ctf-winner/.venv/bin/activate" >> ~/.bashrc
-```
-
+The `ctf` command is now available inside the venv. 
 ---
 
 ## Commands
