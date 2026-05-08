@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 # Headers we always check for presence; missing → one observation each.
 _SECURITY_HEADERS = [
@@ -30,32 +31,51 @@ _SECURITY_HEADERS = [
 _DISCLOSURE_HEADERS = ["Server", "X-Powered-By", "X-AspNet-Version", "X-Generator"]
 
 
+def _port_from_url(url: str | None) -> int | None:
+    """Derive the TCP port a URL implies. https://x → 443, http://x → 80,
+    and explicit ':NNNN' wins. Used so URL-level findings (missing headers,
+    cookies, technologies, content) can be attributed to the port they
+    were actually observed on."""
+    if not url:
+        return None
+    p = urlparse(url)
+    if p.port:
+        return p.port
+    if p.scheme == "https":
+        return 443
+    if p.scheme == "http":
+        return 80
+    return None
+
+
 def to_observations(scan: dict) -> list[dict]:
     """Flatten a scan result into observation rows.
 
-    Returns a list of dicts, each shaped:
-
-        {
-          "id": "OPEN_PORT",                 # stable rule id
-          "title": "Open port 443/tcp ...",  # human-readable
-          "category": "Service Discovery",
-          "host": "1.2.3.4",
-          "port": 443,                       # may be null for host-level rows
-          "evidence": { ... },               # raw observation data
-          "source": "nmap"                   # which probe surfaced it
-        }
+    Each row carries the port the finding lives on:
+      - port-scan rows (OPEN_PORT, BANNER, TLS_*, HTTP_ON_PORT) — port from scan
+      - URL-level rows (HTTP_*, MISSING_*, TECHNOLOGY, content, discovery) —
+        port derived from the analyzed URL (final_url after redirects, falling
+        back to resolved_url if the request failed)
+      - host-level rows (OS_FINGERPRINT) — port=null (genuinely whole-host)
     """
     host = scan.get("host")
     target = scan.get("target")
+
+    # URL-level findings inherit the port the URL implies. Prefer the post-redirect
+    # final URL since that's where headers/cookies/body actually came from.
+    http = scan.get("http") or {}
+    url_for_port = http.get("final_url") or scan.get("resolved_url")
+    url_port = _port_from_url(url_for_port)
+
     rows: list[dict] = []
     counter = _Counter()
 
     rows.extend(_obs_os(scan, host, counter))
     rows.extend(_obs_ports(scan, host, counter))
-    rows.extend(_obs_http(scan, host, target, counter))
-    rows.extend(_obs_technologies(scan, host, counter))
-    rows.extend(_obs_content(scan, host, counter))
-    rows.extend(_obs_discovery(scan, host, counter))
+    rows.extend(_obs_http(scan, host, target, url_port, counter))
+    rows.extend(_obs_technologies(scan, host, url_port, counter))
+    rows.extend(_obs_content(scan, host, url_port, counter))
+    rows.extend(_obs_discovery(scan, host, url_port, counter))
 
     return rows
 
@@ -159,13 +179,13 @@ def _obs_ports(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
             )
 
 
-def _obs_http(scan: dict, host: str, target: str, c: "_Counter") -> Iterable[dict]:
+def _obs_http(scan: dict, host: str, target: str, port: int | None, c: "_Counter") -> Iterable[dict]:
     http = scan.get("http") or {}
     if not http or http.get("error"):
         if http.get("error"):
             yield _row(
                 c, "HTTP_ERROR", f"HTTP request failed: {http['error']}",
-                category="Service Discovery", host=host, port=None,
+                category="Service Discovery", host=host, port=port,
                 evidence={"error": http["error"], "target": target},
                 source="http",
             )
@@ -177,7 +197,7 @@ def _obs_http(scan: dict, host: str, target: str, c: "_Counter") -> Iterable[dic
     yield _row(
         c, "HTTP_RESPONSE",
         f"HTTP {http.get('status_code')} from {http.get('final_url', target)}",
-        category="Service Discovery", host=host, port=None,
+        category="Service Discovery", host=host, port=port,
         evidence={
             "status_code": http.get("status_code"),
             "final_url": http.get("final_url"),
@@ -192,7 +212,7 @@ def _obs_http(scan: dict, host: str, target: str, c: "_Counter") -> Iterable[dic
             yield _row(
                 c, "HTTP_HEADER_DISCLOSURE",
                 f"{name} header reveals: {headers[name]}",
-                category="Information Disclosure", host=host, port=None,
+                category="Information Disclosure", host=host, port=port,
                 evidence={"header": name, "value": headers[name]},
                 source="http",
             )
@@ -203,7 +223,7 @@ def _obs_http(scan: dict, host: str, target: str, c: "_Counter") -> Iterable[dic
             yield _row(
                 c, "MISSING_SECURITY_HEADER",
                 f"Missing security header: {name}",
-                category="Configuration", host=host, port=None,
+                category="Configuration", host=host, port=port,
                 evidence={"header": name},
                 source="http",
             )
@@ -222,13 +242,13 @@ def _obs_http(scan: dict, host: str, target: str, c: "_Counter") -> Iterable[dic
             f"Cookie '{cookie.get('name')}' flags: " + (
                 "all set" if not missing_flags else f"missing {', '.join(missing_flags)}"
             ),
-            category="Configuration", host=host, port=None,
+            category="Configuration", host=host, port=port,
             evidence=cookie,
             source="http",
         )
 
 
-def _obs_technologies(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
+def _obs_technologies(scan: dict, host: str, port: int | None, c: "_Counter") -> Iterable[dict]:
     for tech in scan.get("technologies", []) or []:
         if tech.get("name") == "Missing Security Headers":
             # Already emitted as MISSING_SECURITY_HEADER rows.
@@ -236,20 +256,20 @@ def _obs_technologies(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
         yield _row(
             c, "TECHNOLOGY",
             f"{tech.get('name')} ({tech.get('category')})",
-            category="Technology", host=host, port=None,
+            category="Technology", host=host, port=port,
             evidence=tech,
             source="fingerprint",
         )
 
 
-def _obs_content(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
+def _obs_content(scan: dict, host: str, port: int | None, c: "_Counter") -> Iterable[dict]:
     content = scan.get("content") or {}
 
     for form in content.get("forms", []) or []:
         yield _row(
             c, "HTML_FORM",
             f"{form.get('method', 'GET')} form → {form.get('action')}",
-            category="Content", host=host, port=None,
+            category="Content", host=host, port=port,
             evidence=form,
             source="content",
         )
@@ -257,15 +277,17 @@ def _obs_content(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
     for email in content.get("emails", []) or []:
         yield _row(
             c, "EMAIL_DISCLOSURE", f"Email exposed: {email}",
-            category="Information Disclosure", host=host, port=None,
+            category="Information Disclosure", host=host, port=port,
             evidence={"email": email},
             source="content",
         )
 
     for js in content.get("js_files", []) or []:
+        # JS files may be hosted on a different origin (CDN). If so, the row
+        # is still attributable to the *page* port that referenced them.
         yield _row(
             c, "JS_FILE", f"JavaScript bundle: {js}",
-            category="Content", host=host, port=None,
+            category="Content", host=host, port=port,
             evidence={"url": js},
             source="content",
         )
@@ -273,13 +295,13 @@ def _obs_content(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
     for comment in content.get("html_comments", []) or []:
         yield _row(
             c, "HTML_COMMENT", f"HTML comment: {comment[:120]}",
-            category="Information Disclosure", host=host, port=None,
+            category="Information Disclosure", host=host, port=port,
             evidence={"comment": comment},
             source="content",
         )
 
 
-def _obs_discovery(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
+def _obs_discovery(scan: dict, host: str, port: int | None, c: "_Counter") -> Iterable[dict]:
     discovery = scan.get("discovery") or {}
     for key, info in discovery.items():
         if not info or info.get("status_code") != 200:
@@ -287,7 +309,7 @@ def _obs_discovery(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
         yield _row(
             c, f"WELL_KNOWN_{key.upper()}",
             f"{key.replace('_', '.')} accessible",
-            category="Information Disclosure", host=host, port=None,
+            category="Information Disclosure", host=host, port=port,
             evidence={"url": info.get("url"), "content": info.get("content")},
             source="well_known",
         )

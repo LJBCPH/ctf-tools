@@ -279,17 +279,31 @@ _HTTP_BODY_FINGERPRINTS = [
 
 
 def _port_scan(host: str, ports: list[int]) -> tuple[list[dict], dict]:
-    """Run nmap when available for OS + service detection, otherwise socket scan.
-    Then enrich every open port with generic probes (raw banner / TLS / HTTP)."""
+    """Two-stage port scan:
+      1. Fast TCP-connect scan (always runs, always reliable, ~1.5s).
+      2. If nmap is available AND any ports came back open, enrich those
+         specific ports with -sV/-O for service version + OS fingerprint.
+
+    This avoids the failure mode where nmap on a heavily-filtered IP
+    (Cloudflare, AWS frontends) times out doing OS detection and returns
+    nothing, leaving us with no port info at all."""
     os_info: dict = {}
-    if shutil.which("nmap"):
-        results, os_info = _nmap_scan(host, ports)
-    else:
-        results = _socket_scan(host, ports)
+    results = _socket_scan(host, ports)
+    open_entries = [e for e in results if e.get("state") == "open"]
+
+    if open_entries and shutil.which("nmap"):
+        open_port_list = [e["port"] for e in open_entries]
+        nmap_results, os_info = _nmap_scan(host, open_port_list)
+        if nmap_results:
+            # Merge: nmap row replaces socket row when they agree on a port.
+            by_port = {e["port"]: e for e in results}
+            for nr in nmap_results:
+                by_port[nr["port"]] = nr
+            results = sorted(by_port.values(), key=lambda r: r["port"])
+            open_entries = [e for e in results if e.get("state") == "open"]
 
     # Generic probe pass — concurrent across all open ports so total enrichment
     # time is bounded by the slowest single port, not summed across them.
-    open_entries = [e for e in results if e.get("state") == "open"]
     if open_entries:
         with ThreadPoolExecutor(max_workers=min(16, len(open_entries))) as pool:
             futures = {pool.submit(_probe_port, host, e["port"]): e for e in open_entries}
@@ -302,16 +316,20 @@ def _port_scan(host: str, ports: list[int]) -> tuple[list[dict], dict]:
 
 
 def _nmap_scan(host: str, ports: list[int]) -> tuple[list[dict], dict]:
+    """Targeted version + OS fingerprint scan. Caller passes only already-known-open
+    ports so this is fast even on filtered hosts where OS detection might otherwise
+    drag on. If nmap times out we still get socket-level info from the caller."""
     port_str = ",".join(str(p) for p in ports)
     cmd = [
         "nmap", "-sV", "--version-intensity", "5", "--open",
         "-T4",                           # aggressive timing template
         "-O", "--osscan-guess", "--max-os-tries", "1",
-        "--host-timeout", "120s",
+        "-Pn",                           # don't ping — caller proved the host is up
+        "--host-timeout", "60s",
         "-p", port_str, "-oX", "-", host,
     ]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=150).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=75).stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return [], {}
 
@@ -560,18 +578,45 @@ def _resolve_url(host: str, port_hint: int | None) -> tuple[str | None, str | No
     return None, None
 
 
+def _sanitize_location(value: str, base: str) -> str:
+    """Pick the first valid Location URL, even if the server sent multiple
+    Location headers (urllib3 joins them with ', ' which requests then tries
+    to follow as one giant URL — Cloudflare's 1.1.1.1 redirect does this).
+    Also resolves relative redirects against the current URL."""
+    if not value:
+        return ""
+    # First Location wins; trailing entries are almost always duplicates.
+    first = value.split(",")[0].strip()
+    if first.startswith(("http://", "https://")):
+        return first
+    return urljoin(base, first)
+
+
 def _http_analysis(target: str) -> dict:
+    """Manually follow redirects so we can sanitize malformed Location headers
+    instead of letting requests build a corrupt final URL."""
     session = requests.Session()
     headers = {"User-Agent": _UA}
-    redirect_chain = []
+    redirect_chain: list[dict] = []
+    current = target
+    resp = None
 
     try:
-        resp = session.get(target, headers=headers, timeout=15,
-                           allow_redirects=True, verify=False)
-        for r in resp.history:
-            redirect_chain.append({"url": r.url, "status_code": r.status_code})
+        for _ in range(10):  # cap redirects
+            resp = session.get(current, headers=headers, timeout=15,
+                               allow_redirects=False, verify=False)
+            if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+                redirect_chain.append({"url": current, "status_code": resp.status_code})
+                current = _sanitize_location(resp.headers["Location"], current)
+                if not current:
+                    break
+                continue
+            break
     except requests.RequestException as e:
         return {"error": str(e)}
+
+    if resp is None:
+        return {"error": "no response"}
 
     cookies = []
     for c in resp.cookies:
@@ -586,7 +631,7 @@ def _http_analysis(target: str) -> dict:
 
     return {
         "status_code": resp.status_code,
-        "final_url": resp.url,
+        "final_url": current,
         "redirect_chain": redirect_chain,
         "headers": dict(resp.headers),
         "cookies": cookies,
