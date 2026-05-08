@@ -14,7 +14,9 @@ def cli():
 from ctf.password import password
 from ctf.web import web
 from ctf.recon import recon
+from ctf.scan import scan
 
 cli.add_command(password)
 cli.add_command(web)
 cli.add_command(recon)
+cli.add_command(scan)

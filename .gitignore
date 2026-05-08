@@ -7,3 +7,5 @@ build/
 found.txt
 *.local.md
 .claude/
+example_ctfs/
+.CLAUDE.md
