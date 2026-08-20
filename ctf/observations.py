@@ -71,6 +71,7 @@ def to_observations(scan: dict) -> list[dict]:
     counter = _Counter()
 
     rows.extend(_obs_os(scan, host, counter))
+    rows.extend(_obs_icmp(scan, host, counter))
     rows.extend(_obs_ports(scan, host, counter))
     rows.extend(_obs_http(scan, host, target, url_port, counter))
     rows.extend(_obs_technologies(scan, host, url_port, counter))
@@ -93,6 +94,26 @@ def _obs_os(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
         category="Service Discovery", host=host, port=None,
         evidence=os_info, source="nmap",
         title_extra=os_info.get("name"),
+    )
+
+
+def _obs_icmp(scan: dict, host: str, c: "_Counter") -> Iterable[dict]:
+    icmp = scan.get("icmp") or {}
+    if not icmp.get("responded"):
+        return
+    yield _row(
+        c, "ICMP_TIMESTAMP",
+        "Host answers ICMP timestamp requests (CVE-1999-0524)",
+        category="Information Disclosure", host=host, port=None,
+        evidence={
+            "cve": icmp.get("cve", "CVE-1999-0524"),
+            "responder": icmp.get("responder"),
+            "receive_ts": icmp.get("receive_ts"),
+            "transmit_ts": icmp.get("transmit_ts"),
+            "clock_skew_ms": icmp.get("clock_skew_ms"),
+            "rtt_ms": icmp.get("rtt_ms"),
+        },
+        source="icmp_timestamp",
     )
 
 
