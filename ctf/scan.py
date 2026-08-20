@@ -1,10 +1,14 @@
 import json
+import os
 import re
+import select
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
@@ -124,6 +128,7 @@ def run_scan(
     ports: str = DEFAULT_PORTS,
     include_ports: bool = True,
     include_discovery: bool = True,
+    include_icmp: bool = False,
     quiet: bool = False,
 ) -> dict:
     """Run a scan and return the raw result dict.
@@ -156,6 +161,7 @@ def run_scan(
         "technologies": [],
         "content": {},
         "discovery": {},
+        "icmp": {},
     }
 
     port_list: list[int] = []
@@ -170,11 +176,14 @@ def run_scan(
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_ports = pool.submit(_port_scan, host, port_list) if include_ports else None
         f_resolve = pool.submit(_resolve_url, host, port_hint) if not url else None
+        f_icmp = pool.submit(_icmp_timestamp, host) if include_icmp else None
 
         if f_ports:
             result["ports"], result["os"] = f_ports.result()
         if f_resolve:
             url, origin = f_resolve.result()
+        if f_icmp:
+            result["icmp"] = f_icmp.result()
 
     if not quiet:
         mode = "url" if t["url"] else ("auto-url" if url else "host-only")
@@ -210,10 +219,13 @@ def run_scan(
               show_default=True, help="Comma-separated ports to probe")
 @click.option("--no-ports", is_flag=True, help="Skip port scanning entirely")
 @click.option("--no-discovery", is_flag=True, help="Skip robots/sitemap/security.txt fetch")
+@click.option("--icmp", "include_icmp", is_flag=True,
+              help="Also send an ICMP timestamp probe (CVE-1999-0524). "
+                   "Needs a raw socket: root / CAP_NET_RAW, or Administrator.")
 @click.option("--observations", "as_observations", is_flag=True,
               help="Emit flat observations list (UI-ready rows) instead of raw scan tree")
 @click.option("-o", "--output", default=None, help="Write JSON to this file instead of stdout")
-def run(target, ports, no_ports, no_discovery, as_observations, output):
+def run(target, ports, no_ports, no_discovery, include_icmp, as_observations, output):
     """Run a full passive + active scan and emit JSON results."""
     from ctf.observations import to_observations
 
@@ -222,6 +234,7 @@ def run(target, ports, no_ports, no_discovery, as_observations, output):
         ports=ports,
         include_ports=not no_ports,
         include_discovery=not no_discovery,
+        include_icmp=include_icmp,
     )
 
     payload = to_observations(raw) if as_observations else raw
@@ -233,6 +246,46 @@ def run(target, ports, no_ports, no_discovery, as_observations, output):
         console.print(f"\n[green][+][/green] Results written to [bold]{output}[/bold]")
     else:
         print(out)
+
+
+@scan.command(name="icmp")
+@click.option("-t", "--target", required=True,
+              help="Target — IP or hostname (any port/scheme in the value is ignored)")
+@click.option("--timeout", default=2.0, show_default=True, type=float,
+              help="Seconds to wait for the timestamp reply")
+@click.option("-o", "--output", default=None, help="Write JSON to this file instead of stdout")
+def icmp(target, timeout, output):
+    """Probe for ICMP Timestamp responses (CVE-1999-0524).
+
+    A host that answers an ICMP Timestamp Request (ICMP type 13) with a
+    Timestamp Reply (type 14) discloses its system clock — the low-severity
+    information leak that Nessus (plugin 10114), Qualys (82003) and OpenVAS
+    report as CVE-1999-0524. Sending/receiving raw ICMP needs elevated
+    privileges (root / CAP_NET_RAW on Linux, Administrator on Windows).
+    """
+    t = _normalize_target(target)
+    res = _icmp_timestamp(t["host"], timeout=timeout)
+
+    out = json.dumps(res, indent=2, default=str)
+    if output:
+        with open(output, "w") as f:
+            f.write(out)
+        console.print(f"\n[green][+][/green] Results written to [bold]{output}[/bold]")
+    else:
+        print(out)
+
+    if res.get("responded"):
+        console.print(
+            f"[yellow][!][/yellow] [bold]{t['host']}[/bold] answers ICMP timestamp "
+            f"requests — CVE-1999-0524 (system clock disclosed)."
+        )
+    elif res.get("error"):
+        console.print(f"[red][x][/red] {res['error']}")
+    else:
+        console.print(
+            f"[green][+][/green] [bold]{t['host']}[/bold] did not answer "
+            f"(type 13 filtered or ignored)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +369,14 @@ def _port_scan(host: str, ports: list[int]) -> tuple[list[dict], dict]:
 
 
 def _nmap_scan(host: str, ports: list[int]) -> tuple[list[dict], dict]:
-    """Targeted version + OS fingerprint scan. Caller passes only already-known-open
-    ports so this is fast even on filtered hosts where OS detection might otherwise
-    drag on. If nmap times out we still get socket-level info from the caller."""
+    """Targeted service-version scan. Caller passes only already-known-open ports
+    so this is fast even on filtered hosts. OS fingerprinting (-O) is intentionally
+    omitted: it needs raw sockets (CAP_NET_RAW) which we don't grant in the API
+    container. Run the CLI with sudo on bare metal if you need OS detection."""
     port_str = ",".join(str(p) for p in ports)
     cmd = [
         "nmap", "-sV", "--version-intensity", "5", "--open",
         "-T4",                           # aggressive timing template
-        "-O", "--osscan-guess", "--max-os-tries", "1",
         "-Pn",                           # don't ping — caller proved the host is up
         "--host-timeout", "60s",
         "-p", port_str, "-oX", "-", host,
@@ -404,6 +457,141 @@ def _socket_scan(host: str, ports: list[int]) -> list[dict]:
                 results.append(r)
     results.sort(key=lambda r: r["port"])
     return results
+
+
+# ---------------------------------------------------------------------------
+# ICMP timestamp probe (CVE-1999-0524)
+# ---------------------------------------------------------------------------
+# A host that answers an ICMP Timestamp Request (type 13) with a Timestamp
+# Reply (type 14) leaks its system clock — the classic low-severity finding
+# vuln scanners report as CVE-1999-0524 (Nessus 10114, Qualys 82003, OpenVAS).
+# Raw ICMP send/recv needs a raw socket, which requires elevated privileges
+# (root / CAP_NET_RAW on Linux, Administrator on Windows). Without them
+# socket() raises PermissionError, which we surface as a clean error field
+# rather than a crash — the same reason nmap -O is skipped in the API container.
+
+_ICMP_TIMESTAMP = 13
+_ICMP_TIMESTAMP_REPLY = 14
+
+
+def _icmp_checksum(data: bytes) -> int:
+    """RFC 1071 internet checksum. 16-bit words are assembled big-endian so the
+    result is byte-order independent when packed back with struct '!H'."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+def _ms_since_midnight_utc() -> int:
+    """ICMP timestamps are milliseconds since midnight UTC, in a 32-bit field."""
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((now - midnight).total_seconds() * 1000) & 0xFFFFFFFF
+
+
+def _parse_icmp_timestamp_reply(data: bytes, ident: int, seq: int) -> dict | None:
+    """Extract the ICMP payload from a received IPv4 packet and return the
+    reply's three timestamps, but only if it's a type-14 reply matching the
+    identifier/sequence we sent. Returns None for anything else (other ICMP
+    traffic can land on the raw socket)."""
+    if len(data) < 28:                 # 20-byte min IP header + 8-byte ICMP header
+        return None
+    ihl = (data[0] & 0x0F) * 4         # IPv4 header length from the IHL nibble
+    icmp = data[ihl:]
+    if len(icmp) < 20:
+        return None
+    icmp_type, _code, _chk, r_id, r_seq = struct.unpack("!BBHHH", icmp[:8])
+    if icmp_type != _ICMP_TIMESTAMP_REPLY or r_id != ident or r_seq != seq:
+        return None
+    originate, receive, transmit = struct.unpack("!III", icmp[8:20])
+    return {"originate": originate, "receive": receive, "transmit": transmit}
+
+
+def _icmp_timestamp(host: str, timeout: float = 2.0) -> dict:
+    """Send one ICMP Timestamp Request and wait for the reply.
+
+    Never raises. Every failure mode comes back as structured fields:
+      supported  — True if it replied, False if it stayed silent, None if we
+                   couldn't even ask (no privileges / unresolvable host)
+      responded  — bool, convenience mirror of a successful reply
+      error/note — human-readable reason when supported is None/False
+
+    On a reply, also reports the disclosed remote clock and its skew from ours.
+    """
+    try:
+        dest = socket.gethostbyname(host)
+    except socket.gaierror as e:
+        return {"supported": None, "responded": False, "error": f"resolve failed: {e}"}
+
+    ident = os.getpid() & 0xFFFF
+    seq = 1
+    originate = _ms_since_midnight_utc()
+
+    head = struct.pack("!BBHHH", _ICMP_TIMESTAMP, 0, 0, ident, seq)
+    body = struct.pack("!III", originate, 0, 0)
+    chk = _icmp_checksum(head + body)
+    packet = struct.pack("!BBHHH", _ICMP_TIMESTAMP, 0, chk, ident, seq) + body
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except PermissionError:
+        return {
+            "supported": None, "responded": False, "host": dest,
+            "error": "raw socket denied — run with root / CAP_NET_RAW (Linux) "
+                     "or Administrator (Windows)",
+        }
+    except OSError as e:
+        return {"supported": None, "responded": False, "host": dest, "error": str(e)}
+
+    try:
+        sent_at = time.monotonic()
+        sock.sendto(packet, (dest, 0))
+        deadline = sent_at + timeout
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "supported": False, "responded": False, "host": dest,
+                    "note": "no ICMP timestamp reply within timeout — host filters "
+                            "type 13 or does not answer",
+                }
+            if not select.select([sock], [], [], remaining)[0]:
+                continue
+            data, addr = sock.recvfrom(1024)
+            parsed = _parse_icmp_timestamp_reply(data, ident, seq)
+            if parsed is None:
+                continue  # unrelated ICMP on the raw socket — keep waiting
+            our_recv = _ms_since_midnight_utc()
+            return {
+                "supported": True,
+                "responded": True,
+                "host": dest,
+                "responder": addr[0],
+                "rtt_ms": round((time.monotonic() - sent_at) * 1000, 2),
+                "originate_ts": originate,
+                "receive_ts": parsed["receive"],
+                "transmit_ts": parsed["transmit"],
+                "clock_skew_ms": parsed["transmit"] - our_recv,
+                "cve": "CVE-1999-0524",
+            }
+    except PermissionError:
+        # Windows in particular allows the raw socket to be created but denies
+        # sendto/recvfrom (WinError 10013) unless the process is elevated.
+        return {
+            "supported": None, "responded": False, "host": dest,
+            "error": "raw socket send/recv denied — run with root / CAP_NET_RAW "
+                     "(Linux) or Administrator (Windows)",
+        }
+    except OSError as e:
+        return {"supported": None, "responded": False, "host": dest, "error": str(e)}
+    finally:
+        sock.close()
 
 
 # ---------------------------------------------------------------------------

@@ -17,10 +17,14 @@ dependencies = [
 dev = [
     "pre-commit>=3.0",
 ]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
 
 [project.scripts]
 ctf = "ctf.main:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ctf*"]
+include = ["ctf*", "api*"]
